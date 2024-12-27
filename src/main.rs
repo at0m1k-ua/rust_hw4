@@ -1,10 +1,10 @@
-use actix_web::{web, App, HttpServer, Responder};
-use actix_web::{get, post, HttpResponse};
+use actix_web::{web, App, HttpResponse, HttpServer, Responder};
+use actix_web::{get, post};
 use actix_files as fs;
-use actix_web_actors::ws;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
+use actix_cors::Cors;
 use uuid::Uuid;
 
 mod chat_websocket {
@@ -53,6 +53,10 @@ struct AppState {
 
 #[post("/register")]
 async fn register(user: web::Json<User>, data: web::Data<AppState>) -> impl Responder {
+    if user.username.trim().is_empty() || user.password.trim().is_empty() {
+        return HttpResponse::BadRequest().body("Username and password cannot be empty");
+    }
+
     let mut users = data.users.lock().unwrap();
 
     if users.contains_key(&user.username) {
@@ -65,6 +69,10 @@ async fn register(user: web::Json<User>, data: web::Data<AppState>) -> impl Resp
 
 #[post("/login")]
 async fn login(user: web::Json<User>, data: web::Data<AppState>) -> impl Responder {
+    if user.username.trim().is_empty() || user.password.trim().is_empty() {
+        return HttpResponse::BadRequest().body("Username and password cannot be empty");
+    }
+
     let users = data.users.lock().unwrap();
 
     match users.get(&user.username) {
@@ -84,6 +92,30 @@ async fn get_history(username: web::Path<String>, data: web::Data<AppState>) -> 
     }
 }
 
+#[derive(Deserialize)]
+struct MessageData {
+    sender: String,
+    recipient: String,
+    content: String,
+}
+
+#[post("/send_message")]
+async fn send_message(msg: web::Json<MessageData>, data: web::Data<AppState>) -> impl Responder {
+    if msg.sender.trim().is_empty() || msg.recipient.trim().is_empty() || msg.content.trim().is_empty() {
+        return HttpResponse::BadRequest().body("Sender, recipient, and content cannot be empty");
+    }
+
+    let mut messages = data.messages.lock().unwrap();
+    let recipient_messages = messages.entry(msg.recipient.clone()).or_insert_with(Vec::new);
+    recipient_messages.push(Message {
+        sender: msg.sender.clone(),
+        recipient: msg.recipient.clone(),
+        content: msg.content.clone(),
+    });
+
+    HttpResponse::Ok().body("Message sent")
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let app_state = web::Data::new(AppState {
@@ -93,10 +125,15 @@ async fn main() -> std::io::Result<()> {
 
     HttpServer::new(move || {
         App::new()
+            .wrap(Cors::default()
+                .allow_any_origin()
+                .allow_any_method()
+                .allow_any_header())
             .app_data(app_state.clone())
             .service(register)
             .service(login)
             .service(get_history)
+            .service(send_message)
             .route("/ws/", web::get().to(start_chat))
             .service(fs::Files::new("/", "./static").index_file("index.html"))
     })
