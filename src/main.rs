@@ -4,22 +4,26 @@ use actix_web_actors::ws;
 use actix_cors::Cors;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use mongodb::{bson::{self, doc}, options::ClientOptions, Client, Collection};
+use std::sync::Arc;
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 struct Room {
     id: Uuid,
     name: String,
     creator: String,
-    users: HashSet<String>,
+    users: Vec<String>,
 }
 
-#[derive(Default)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct User {
+    username: String,
+    password: String,
+}
+
 struct AppState {
-    users: Mutex<HashMap<String, String>>,               // username -> password
-    rooms: Mutex<HashMap<Uuid, Room>>,                  // room_id -> Room
-    connections: Mutex<HashMap<Uuid, Vec<Addr<WebSocketSession>>>>, // room_id -> WebSocket connections
+    users_collection: Collection<User>,
+    rooms_collection: Collection<Room>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -42,194 +46,137 @@ struct CreateRoomRequest {
 
 #[derive(Deserialize)]
 struct AddUserRequest {
-    room_id: Uuid,
+    room_id: String,
     username: String,
 }
 
-#[derive(Deserialize, Message)]
-#[rtype(result = "()")]
-struct ChatMessage {
-    room_id: Uuid,
-    username: String,
-    message: String,
-}
-
-// WebSocket Session
-struct WebSocketSession {
-    room_id: Uuid,
-    username: String,
-    app_state: Arc<AppState>,
-}
-
-impl Actor for WebSocketSession {
-    type Context = ws::WebsocketContext<Self>;
-
-    fn started(&mut self, ctx: &mut Self::Context) {
-        let mut connections = self.app_state.connections.lock().unwrap();
-        connections
-            .entry(self.room_id)
-            .or_insert_with(Vec::new)
-            .push(ctx.address());
-    }
-
-    fn stopped(&mut self, ctx: &mut Self::Context) {
-        let mut connections = self.app_state.connections.lock().unwrap();
-        if let Some(users) = connections.get_mut(&self.room_id) {
-            users.retain(|addr| addr != &ctx.address());
-        }
-    }
-}
-
-impl Handler<ChatMessage> for WebSocketSession {
-    type Result = ();
-
-    fn handle(&mut self, msg: ChatMessage, ctx: &mut Self::Context) {
-        if msg.room_id == self.room_id {
-            ctx.text(msg.message);
-        }
-    }
-}
-
-impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WebSocketSession {
-    fn handle(&mut self, msg: Result<ws::Message, ws::ProtocolError>, ctx: &mut Self::Context) {
-        if let Ok(ws::Message::Text(text)) = msg {
-            if let Ok(text_string) = String::from_utf8(text.as_bytes().to_vec()) {
-                let connections = self.app_state.connections.lock().unwrap();
-                if let Some(users) = connections.get(&self.room_id) {
-                    for user in users {
-                        user.do_send(ChatMessage {
-                            room_id: self.room_id,
-                            username: self.username.clone(),
-                            message: text_string.clone(),
-                        });
-                    }
-                }
-            } else {
-                ctx.text("Invalid UTF-8 data received.");
-            }
-        }
-    }
-}
-
-
-// WebSocket handler
-async fn websocket_handler(
-    req: HttpRequest,
-    stream: web::Payload,
+async fn register(
     data: web::Data<Arc<AppState>>,
-) -> Result<HttpResponse, actix_web::Error> {
-    let query_string = req.query_string();
-    let query_params: HashMap<String, String> = serde_urlencoded::from_str(query_string)
-        .map_err(|_| actix_web::error::ErrorBadRequest("Invalid query string"))?;
+    req: web::Json<RegisterRequest>,
+) -> HttpResponse {
+    let new_user = User {
+        username: req.username.clone(),
+        password: req.password.clone(),
+    };
 
-    let room_id = query_params
-        .get("roomId")
-        .and_then(|id| Uuid::parse_str(id).ok())
-        .ok_or_else(|| actix_web::error::ErrorBadRequest("Missing or invalid roomId"))?;
-
-    let username = query_params
-        .get("username")
-        .cloned()
-        .unwrap_or_else(|| "guest".to_string());
-
-    ws::start(
-        WebSocketSession {
-            room_id,
-            username,
-            app_state: data.get_ref().clone(),
-        },
-        &req,
-        stream,
-    )
-}
-
-// REST API Handlers
-async fn register(data: web::Data<Arc<AppState>>, req: web::Json<RegisterRequest>) -> HttpResponse {
-    log::info!("Incoming register request: {:?}", req);
-
-    let mut users = data.users.lock().unwrap_or_else(|e| {
-        log::error!("Failed to lock users: {:?}", e);
-        panic!("Mutex poisoned");
-    });
-
-    if users.contains_key(&req.username) {
-        log::warn!("User already exists: {}", req.username);
-        return HttpResponse::Conflict().body("User already exists");
-    }
-
-    users.insert(req.username.clone(), req.password.clone());
-    log::info!("User registered successfully: {}", req.username);
-
-    HttpResponse::Ok().body("User registered successfully")
-}
-
-async fn login(data: web::Data<Arc<AppState>>, req: web::Json<LoginRequest>) -> HttpResponse {
-    let users = data.users.lock().unwrap();
-    if let Some(password) = users.get(&req.username) {
-        if password == &req.password {
-            return HttpResponse::Ok().body("Login successful");
+    let result = data.users_collection.insert_one(new_user).await;
+    match result {
+        Ok(_) => HttpResponse::Ok().body("User registered successfully"),
+        Err(err) => {
+            log::error!("Failed to register user: {:?}", err);
+            HttpResponse::InternalServerError().body("Failed to register user")
         }
     }
-    HttpResponse::Unauthorized().body("Invalid username or password")
 }
 
-async fn create_room(data: web::Data<Arc<AppState>>, req: web::Json<CreateRoomRequest>) -> HttpResponse {
-    let mut rooms = data.rooms.lock().unwrap();
-    let room = Room {
+async fn login(
+    data: web::Data<Arc<AppState>>,
+    req: web::Json<LoginRequest>,
+) -> HttpResponse {
+    let filter = doc! {"username": &req.username, "password": &req.password};
+    let user = data.users_collection.find_one(filter).await;
+    match user {
+        Ok(Some(_)) => HttpResponse::Ok().body("Login successful"),
+        Ok(None) => HttpResponse::Unauthorized().body("Invalid username or password"),
+        Err(err) => {
+            log::error!("Failed to log in: {:?}", err);
+            HttpResponse::InternalServerError().body("Failed to log in")
+        }
+    }
+}
+
+async fn create_room(
+    data: web::Data<Arc<AppState>>,
+    req: web::Json<CreateRoomRequest>,
+) -> HttpResponse {
+    let new_room = Room {
         id: Uuid::new_v4(),
         name: req.name.clone(),
         creator: req.creator.clone(),
-        users: HashSet::new(),
+        users: vec![req.creator.clone()],
     };
-    rooms.insert(room.id, room.clone());
-    HttpResponse::Ok().json(room)
+
+    let result = data.rooms_collection.insert_one(&new_room).await;
+    match result {
+        Ok(_) => HttpResponse::Ok().json(new_room),
+        Err(err) => {
+            log::error!("Failed to create room: {:?}", err);
+            HttpResponse::InternalServerError().body("Failed to create room")
+        }
+    }
 }
 
-async fn add_user(data: web::Data<Arc<AppState>>, req: web::Json<AddUserRequest>) -> HttpResponse {
-    let mut rooms = data.rooms.lock().unwrap();
-    if let Some(room) = rooms.get_mut(&req.room_id) {
-        room.users.insert(req.username.clone());
-        return HttpResponse::Ok().json(room.clone());
+async fn add_user(
+    data: web::Data<Arc<AppState>>,
+    req: web::Json<AddUserRequest>,
+) -> HttpResponse {
+    let room_id = Uuid::parse_str(&req.room_id).unwrap_or(Uuid::nil());
+    let filter = doc! {"id": bson::to_bson(&room_id).unwrap()};
+    let update = doc! {"$push": {"users": &req.username}};
+
+    let result = data.rooms_collection.update_one(filter, update).await;
+    match result {
+        Ok(update_result) if update_result.matched_count > 0 => HttpResponse::Ok().body("User added to room"),
+        Ok(_) => HttpResponse::NotFound().body("Room not found"),
+        Err(err) => {
+            log::error!("Failed to add user to room: {:?}", err);
+            HttpResponse::InternalServerError().body("Failed to add user to room")
+        }
     }
-    HttpResponse::NotFound().body("Room not found")
 }
 
 async fn list_rooms(data: web::Data<Arc<AppState>>) -> HttpResponse {
-    let rooms = data.rooms.lock().unwrap();
-    let room_list: Vec<_> = rooms.values().cloned().collect();
-    HttpResponse::Ok().json(room_list)
+    let cursor = data.rooms_collection.find(doc! {}).await;
+    match cursor {
+        Ok(mut rooms_cursor) => {
+            let mut rooms = vec![];
+            while let Some(room) = rooms_cursor.next().await {
+                match room {
+                    Ok(room_doc) => rooms.push(room_doc),
+                    Err(err) => {
+                        log::error!("Error reading room: {:?}", err);
+                        return HttpResponse::InternalServerError().body("Failed to fetch rooms");
+                    }
+                }
+            }
+            HttpResponse::Ok().json(rooms)
+        }
+        Err(err) => {
+            log::error!("Failed to fetch rooms: {:?}", err);
+            HttpResponse::InternalServerError().body("Failed to fetch rooms")
+        }
+    }
 }
-
-
-use env_logger;
-use log::info;
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     std::env::set_var("RUST_LOG", "debug");
     env_logger::init();
-    info!("Starting server...");
 
-    let app_state = Arc::new(AppState::default());
+    let mongo_uri = "mongodb://localhost:27017";
+    let client_options = ClientOptions::parse(mongo_uri).await.unwrap();
+    let client = Client::with_options(client_options).unwrap();
+
+    let db = client.database("chat_app");
+    let users_collection = db.collection::<User>("users");
+    let rooms_collection = db.collection::<Room>("rooms");
+
+    let app_state = Arc::new(AppState {
+        users_collection,
+        rooms_collection,
+    });
 
     HttpServer::new(move || {
         App::new()
-            .wrap(
-                Cors::default()
-                    .allow_any_origin()
-                    .allow_any_header()
-                    .allow_any_method(),
-            )
+            .wrap(Cors::default().allow_any_origin().allow_any_method().allow_any_header())
             .app_data(web::Data::new(app_state.clone()))
             .route("/register", web::post().to(register))
             .route("/login", web::post().to(login))
             .route("/create_room", web::post().to(create_room))
             .route("/add_user", web::post().to(add_user))
             .route("/list_rooms", web::get().to(list_rooms))
-            .route("/ws/", web::get().to(websocket_handler))
     })
         .bind("127.0.0.1:8080")?
         .run()
         .await
 }
-
