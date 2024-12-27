@@ -50,6 +50,7 @@ struct AddUserRequest {
 #[rtype(result = "()")]
 struct ChatMessage {
     room_id: Uuid,
+    username: String,
     message: String,
 }
 
@@ -98,7 +99,8 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WebSocketSession 
                     for user in users {
                         user.do_send(ChatMessage {
                             room_id: self.room_id,
-                            message: text_string.clone(), // Преобразованный текст
+                            username: self.username.clone(),
+                            message: text_string.clone(),
                         });
                     }
                 }
@@ -108,6 +110,7 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WebSocketSession 
         }
     }
 }
+
 
 // WebSocket handler
 async fn websocket_handler(
