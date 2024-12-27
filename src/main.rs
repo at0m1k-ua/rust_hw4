@@ -1,5 +1,5 @@
 use actix::prelude::*;
-use actix_web::{web, App, HttpServer, HttpResponse, Error, HttpRequest};
+use actix_web::{web, App, HttpServer, HttpResponse, HttpRequest};
 use actix_web_actors::ws;
 use actix_cors::Cors;
 use serde::{Deserialize, Serialize};
@@ -13,6 +13,7 @@ struct Room {
     name: String,
     creator: String,
     users: HashSet<String>,
+    history: Vec<ChatMessage>,
 }
 
 #[derive(Default)]
@@ -46,7 +47,7 @@ struct AddUserRequest {
     username: String,
 }
 
-#[derive(Deserialize, Message)]
+#[derive(Deserialize, Message, Clone, Serialize)]
 #[rtype(result = "()")]
 struct ChatMessage {
     room_id: Uuid,
@@ -96,12 +97,21 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WebSocketSession 
             if let Ok(text_string) = String::from_utf8(text.as_bytes().to_vec()) {
                 let connections = self.app_state.connections.lock().unwrap();
                 if let Some(users) = connections.get(&self.room_id) {
+                    let chat_message = ChatMessage {
+                        room_id: self.room_id,
+                        username: self.username.clone(),
+                        message: text_string.clone(),
+                    };
+
+                    // Broadcast the message to all users in the room
                     for user in users {
-                        user.do_send(ChatMessage {
-                            room_id: self.room_id,
-                            username: self.username.clone(),
-                            message: text_string.clone(),
-                        });
+                        user.do_send(chat_message.clone());
+                    }
+
+                    // Add the message to the room's history
+                    let mut rooms = self.app_state.rooms.lock().unwrap();
+                    if let Some(room) = rooms.get_mut(&self.room_id) {
+                        room.history.push(chat_message);
                     }
                 }
             } else {
@@ -110,6 +120,7 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WebSocketSession 
         }
     }
 }
+
 
 
 // WebSocket handler
@@ -141,6 +152,18 @@ async fn websocket_handler(
         &req,
         stream,
     )
+}
+
+async fn get_chat_history(
+    data: web::Data<Arc<AppState>>,
+    room_id: web::Path<Uuid>,
+) -> HttpResponse {
+    let rooms = data.rooms.lock().unwrap();
+    if let Some(room) = rooms.get(&room_id) {
+        HttpResponse::Ok().json(&room.history)
+    } else {
+        HttpResponse::NotFound().body("Room not found")
+    }
 }
 
 // REST API Handlers
@@ -180,6 +203,7 @@ async fn create_room(data: web::Data<Arc<AppState>>, req: web::Json<CreateRoomRe
         name: req.name.clone(),
         creator: req.creator.clone(),
         users: HashSet::new(),
+        history: Vec::new()
     };
     rooms.insert(room.id, room.clone());
     HttpResponse::Ok().json(room)
@@ -208,7 +232,6 @@ use log::info;
 async fn main() -> std::io::Result<()> {
     std::env::set_var("RUST_LOG", "debug");
     env_logger::init();
-    info!("Starting server...");
 
     let app_state = Arc::new(AppState::default());
 
@@ -226,6 +249,7 @@ async fn main() -> std::io::Result<()> {
             .route("/create_room", web::post().to(create_room))
             .route("/add_user", web::post().to(add_user))
             .route("/list_rooms", web::get().to(list_rooms))
+            .route("/get_chat_history/{room_id}", web::get().to(get_chat_history))
             .route("/ws/", web::get().to(websocket_handler))
     })
         .bind("127.0.0.1:8080")?
